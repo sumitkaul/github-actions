@@ -1,0 +1,136 @@
+name: Stale PR Management
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+
+permissions:
+  contents: read # Needed to checkout the repository, good practice
+  pull-requests: write
+  issues: write
+
+jobs:
+  manage_stale_prs:
+    runs-on: ubuntu-latest
+    env:
+      STALE_PR_30DAY_LABEL: "stale-pr-30days"
+      STALE_PR_45DAY_LABEL: "stale-pr-45days"
+      EXEMPTION_LABEL: "keep-open"
+      DAYS_UNTIL_STALE_30: 30
+      DAYS_UNTIL_STALE_45: 45
+      DAYS_UNTIL_CLOSURE: 47
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      - name: Manage Stale PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # gh cli needs this
+        run: |
+          set -e # Exit on error
+          echo "Starting stale PR management..."
+
+          # Get today's date in seconds since epoch for calculations
+          TODAY_SECONDS=$(date +%s)
+
+          # Fetch PRs
+          echo "Fetching open PRs..."
+          # Using --search "is:open" to ensure we only get open PRs, though --state open should suffice.
+          # Limiting to 100 PRs per run to avoid rate limits or overly long processing times.
+          PR_DATA=$(gh pr list --state open --search "is:open" --json number,title,updatedAt,labels --limit 100)
+
+          # Check if PR_DATA is empty or not an array
+          if ! echo "$PR_DATA" | jq -e 'if type=="array" then true else false end' > /dev/null; then
+            echo "No open PRs found or invalid data from gh pr list. Exiting."
+            exit 0
+          fi
+          
+          echo "Processing PRs..."
+          echo "$PR_DATA" | jq -r -c '.[]' | while IFS= read -r pr_json; do
+            PR_NUMBER=$(echo "$pr_json" | jq -r '.number')
+            PR_UPDATED_AT=$(echo "$pr_json" | jq -r '.updatedAt') # This is in ISO 8601 format e.g., 2023-10-27T10:00:00Z
+            
+            echo "--- Processing PR #$PR_NUMBER ---"
+            # echo "Raw PR JSON: $pr_json" # For debugging, can be noisy
+
+            # Extract label names into an array for easier checking
+            # Use mapfile to read lines into an array, safer for label names with spaces (though unlikely)
+            mapfile -t PR_LABELS < <(echo "$pr_json" | jq -r '.labels[].name')
+            
+            # Check for Exemption Label
+            echo "Checking for exemption label: $EXEMPTION_LABEL"
+            EXEMPT_FOUND=false
+            for label in "${PR_LABELS[@]}"; do
+              if [ "$label" = "$EXEMPTION_LABEL" ]; then
+                EXEMPT_FOUND=true
+                break
+              fi
+            done
+
+            if [ "$EXEMPT_FOUND" = true ]; then
+              echo "PR #$PR_NUMBER has exemption label '$EXEMPTION_LABEL'. Skipping."
+              continue
+            fi
+
+            # Calculate PR Age
+            # Convert PR_UPDATED_AT to seconds since epoch. Works with GNU date.
+            PR_UPDATED_AT_SECONDS=$(date -d "$PR_UPDATED_AT" +%s)
+            PR_AGE_SECONDS=$((TODAY_SECONDS - PR_UPDATED_AT_SECONDS))
+            PR_AGE_DAYS=$((PR_AGE_SECONDS / 86400)) # 86400 seconds in a day
+
+            echo "PR #$PR_NUMBER: Updated at $PR_UPDATED_AT, Age: $PR_AGE_DAYS days."
+
+            # Define current status based on labels
+            HAS_30DAY_LABEL=false
+            for label in "${PR_LABELS[@]}"; do
+              if [ "$label" = "$STALE_PR_30DAY_LABEL" ]; then
+                HAS_30DAY_LABEL=true
+                break
+              fi
+            done
+
+            HAS_45DAY_LABEL=false
+            for label in "${PR_LABELS[@]}"; do
+              if [ "$label" = "$STALE_PR_45DAY_LABEL" ]; then
+                HAS_45DAY_LABEL=true
+                break
+              fi
+            done
+            
+            echo "PR #$PR_NUMBER: Has 30-day label: $HAS_30DAY_LABEL, Has 45-day label: $HAS_45DAY_LABEL"
+
+            # Process for Closure (older than DAYS_UNTIL_CLOSURE)
+            if [ "$PR_AGE_DAYS" -gt "$DAYS_UNTIL_CLOSURE" ] && [ "$HAS_45DAY_LABEL" = true ]; then
+              echo "PR #$PR_NUMBER is older than $DAYS_UNTIL_CLOSURE days (actual: $PR_AGE_DAYS days) and has $STALE_PR_45DAY_LABEL. Closing."
+              gh pr comment "$PR_NUMBER" --body "This PR has been automatically closed due to inactivity beyond $DAYS_UNTIL_CLOSURE days. Last activity was $PR_AGE_DAYS days ago."
+              gh pr close "$PR_NUMBER"
+              echo "PR #$PR_NUMBER closed."
+              continue
+            fi
+
+            # Process for 45-day Stale (older than DAYS_UNTIL_STALE_45)
+            # Must have 30-day label, must NOT have 45-day label yet.
+            if [ "$PR_AGE_DAYS" -gt "$DAYS_UNTIL_STALE_45" ] && [ "$HAS_30DAY_LABEL" = true ] && [ "$HAS_45DAY_LABEL" = false ]; then
+              echo "PR #$PR_NUMBER is older than $DAYS_UNTIL_STALE_45 days (actual: $PR_AGE_DAYS days) and has $STALE_PR_30DAY_LABEL. Marking as 45-day stale."
+              gh pr edit "$PR_NUMBER" --add-label "$STALE_PR_45DAY_LABEL"
+              gh pr edit "$PR_NUMBER" --remove-label "$STALE_PR_30DAY_LABEL" # Clean up previous label
+              DAYS_TO_CLOSURE_FROM_45=$(($DAYS_UNTIL_CLOSURE - $DAYS_UNTIL_STALE_45))
+              gh pr comment "$PR_NUMBER" --body "This PR has been inactive for over $DAYS_UNTIL_STALE_45 days (last activity $PR_AGE_DAYS days ago). It is now marked with '$STALE_PR_45DAY_LABEL' and will be automatically closed in approximately $DAYS_TO_CLOSURE_FROM_45 days if there's no further activity. Please update the PR or add the '$EXEMPTION_LABEL' label if it should remain open."
+              echo "PR #$PR_NUMBER marked with $STALE_PR_45DAY_LABEL and $STALE_PR_30DAY_LABEL removed."
+              continue
+            fi
+
+            # Process for 30-day Stale (older than DAYS_UNTIL_STALE_30)
+            # Must NOT have 30-day label and NOT have 45-day label.
+            if [ "$PR_AGE_DAYS" -gt "$DAYS_UNTIL_STALE_30" ] && [ "$HAS_30DAY_LABEL" = false ] && [ "$HAS_45DAY_LABEL" = false ]; then
+              echo "PR #$PR_NUMBER is older than $DAYS_UNTIL_STALE_30 days (actual: $PR_AGE_DAYS days). Marking as 30-day stale."
+              gh pr edit "$PR_NUMBER" --add-label "$STALE_PR_30DAY_LABEL"
+              gh pr comment "$PR_NUMBER" --body "This PR has been inactive for over $DAYS_UNTIL_STALE_30 days (last activity $PR_AGE_DAYS days ago) and has been marked with '$STALE_PR_30DAY_LABEL'. Please update the PR or it may be considered for closure in the future."
+              echo "PR #$PR_NUMBER marked with $STALE_PR_30DAY_LABEL."
+              continue
+            fi
+
+            echo "PR #$PR_NUMBER: No action taken based on current rules."
+          done
+
+          echo "Stale PR management script finished."
