@@ -1,0 +1,319 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: s3-efs-cleanup-script
+  labels:
+    app.kubernetes.io/name: s3-efs-cleanup
+    app.kubernetes.io/component: cronjob
+    app.kubernetes.io/part-of: data-hygiene
+  annotations:
+    description: |
+      Python script that compares file names in the database with S3 objects and
+      removes the corresponding files from the EFS mount when the objects exist
+      in S3.
+data:
+  cleanup.py: |
+    import json
+    import logging
+    import os
+    import sys
+    from pathlib import Path
+    from typing import List
+
+    import boto3
+    from botocore.exceptions import ClientError
+    import psycopg
+    from psycopg.rows import dict_row
+
+
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    LOGGER = logging.getLogger("s3_efs_cleanup")
+
+
+    def get_database_connection() -> psycopg.Connection:
+        """Create a PostgreSQL connection using environment variables."""
+        try:
+            conn = psycopg.connect(
+                host=os.environ["DB_HOST"],
+                port=int(os.environ.get("DB_PORT", "5432")),
+                dbname=os.environ["DB_NAME"],
+                user=os.environ["DB_USER"],
+                password=os.environ["DB_PASSWORD"],
+                connect_timeout=int(os.environ.get("DB_CONNECT_TIMEOUT", "10")),
+                row_factory=dict_row,
+            )
+            return conn
+        except KeyError as exc:
+            missing = exc.args[0]
+            LOGGER.error("Missing required database environment variable: %s", missing)
+            raise
+
+
+    def fetch_file_rows(connection: psycopg.Connection) -> List[dict]:
+        query = os.environ.get(
+            "FILE_QUERY",
+            "SELECT file_name FROM files_to_validate WHERE synced_to_s3 = true",
+        )
+        LOGGER.info("Running file lookup query")
+        with connection.cursor() as cursor:
+            cursor.execute(query)
+            rows = cursor.fetchall()
+        LOGGER.info("Retrieved %s database rows", len(rows))
+        return rows
+
+
+    def normalise_s3_key(prefix: str, file_name: str) -> str:
+        cleaned_prefix = prefix.strip("/")
+        cleaned_name = file_name.lstrip("/")
+        if cleaned_prefix:
+            return f"{cleaned_prefix}/{cleaned_name}" if cleaned_name else cleaned_prefix
+        return cleaned_name
+
+
+    def resolve_efs_path(base_path: Path, row: dict) -> Path:
+        file_column = os.environ.get("FILE_NAME_COLUMN", "file_name")
+        efs_column = os.environ.get("EFS_PATH_COLUMN")
+
+        if efs_column:
+            efs_value = row.get(efs_column)
+            if not efs_value:
+                LOGGER.warning(
+                    "Row missing EFS path column '%s'; falling back to file column",
+                    efs_column,
+                )
+            else:
+                path = Path(str(efs_value))
+                return path if path.is_absolute() else base_path / path
+
+        file_name = row.get(file_column)
+        if not file_name:
+            raise ValueError(
+                f"Row does not contain file column '{file_column}': {json.dumps(row)}"
+            )
+        return base_path / file_name
+
+
+    def file_exists_in_s3(s3_client, bucket: str, key: str) -> bool:
+        try:
+            s3_client.head_object(Bucket=bucket, Key=key)
+            return True
+        except ClientError as exc:
+            error_code = exc.response.get("Error", {}).get("Code")
+            if error_code in ("404", "NoSuchKey", "NotFound"):
+                return False
+            raise
+
+
+    def delete_file(path: Path) -> bool:
+        if not path.exists():
+            LOGGER.info("Skipping deletion for missing file %s", path)
+            return False
+        if path.is_dir():
+            LOGGER.warning("Path %s is a directory; skipping", path)
+            return False
+        try:
+            path.unlink()
+            LOGGER.info("Deleted %s", path)
+            return True
+        except OSError:
+            LOGGER.exception("Unable to delete %s", path)
+            return False
+
+
+    def main() -> int:
+        bucket = os.environ["S3_BUCKET"]
+        prefix = os.environ.get("S3_PREFIX", "")
+        base_path = Path(os.environ.get("EFS_BASE_PATH", "/efs"))
+
+        if not base_path.exists():
+            LOGGER.error("Configured EFS base path %s does not exist", base_path)
+            return 1
+
+        region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+        session_args = {"region_name": region} if region else {}
+        s3_client = boto3.client("s3", **session_args)
+
+        deleted = 0
+        checked = 0
+
+        with get_database_connection() as connection:
+            rows = fetch_file_rows(connection)
+
+        for row in rows:
+            try:
+                efs_path = resolve_efs_path(base_path, row)
+            except ValueError:
+                LOGGER.exception("Skipping row due to missing data")
+                continue
+
+            file_column = os.environ.get("FILE_NAME_COLUMN", "file_name")
+            file_name = str(row.get(file_column, ""))
+            key = normalise_s3_key(prefix, file_name)
+            if not key:
+                LOGGER.warning("Skipping row with empty S3 key: %s", json.dumps(row))
+                continue
+
+            checked += 1
+            try:
+                if file_exists_in_s3(s3_client, bucket, key):
+                    if delete_file(efs_path):
+                        deleted += 1
+                else:
+                    LOGGER.info("File %s not in S3; keeping %s", key, efs_path)
+            except ClientError:
+                LOGGER.exception("Error checking S3 for %s", key)
+
+        LOGGER.info(
+            "Completed cleanup: %s files checked, %s deleted", checked, deleted
+        )
+        return 0
+
+
+    if __name__ == "__main__":
+        try:
+            sys.exit(main())
+        except KeyError as exc:
+            LOGGER.error("Missing required environment variable: %s", exc)
+            sys.exit(2)
+        except Exception:
+            LOGGER.exception("Unhandled exception during cleanup")
+            sys.exit(3)
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: s3-efs-cleanup
+  labels:
+    app.kubernetes.io/name: s3-efs-cleanup
+    app.kubernetes.io/component: cronjob
+    app.kubernetes.io/part-of: data-hygiene
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: s3-efs-cleanup
+  labels:
+    app.kubernetes.io/name: s3-efs-cleanup
+    app.kubernetes.io/component: cronjob
+    app.kubernetes.io/part-of: data-hygiene
+spec:
+  schedule: "0 * * * *"
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: s3-efs-cleanup
+        spec:
+          serviceAccountName: s3-efs-cleanup
+          restartPolicy: OnFailure
+          containers:
+            - name: cleanup
+              image: python:3.11-slim
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/sh
+                - -c
+                - >-
+                  pip install --no-cache-dir boto3 psycopg[binary] &&
+                  python /scripts/cleanup.py
+              env:
+                - name: S3_BUCKET
+                  valueFrom:
+                    secretKeyRef:
+                      name: s3-efs-cleanup-secrets
+                      key: s3Bucket
+                - name: S3_PREFIX
+                  valueFrom:
+                    configMapKeyRef:
+                      name: s3-efs-cleanup-settings
+                      key: s3Prefix
+                      optional: true
+                - name: AWS_REGION
+                  valueFrom:
+                    configMapKeyRef:
+                      name: s3-efs-cleanup-settings
+                      key: awsRegion
+                      optional: true
+                - name: DB_HOST
+                  valueFrom:
+                    secretKeyRef:
+                      name: s3-efs-cleanup-secrets
+                      key: dbHost
+                - name: DB_PORT
+                  valueFrom:
+                    secretKeyRef:
+                      name: s3-efs-cleanup-secrets
+                      key: dbPort
+                      optional: true
+                - name: DB_NAME
+                  valueFrom:
+                    secretKeyRef:
+                      name: s3-efs-cleanup-secrets
+                      key: dbName
+                - name: DB_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: s3-efs-cleanup-secrets
+                      key: dbUser
+                - name: DB_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: s3-efs-cleanup-secrets
+                      key: dbPassword
+                - name: DB_CONNECT_TIMEOUT
+                  valueFrom:
+                    configMapKeyRef:
+                      name: s3-efs-cleanup-settings
+                      key: dbConnectTimeout
+                      optional: true
+                - name: FILE_QUERY
+                  valueFrom:
+                    configMapKeyRef:
+                      name: s3-efs-cleanup-settings
+                      key: fileQuery
+                      optional: true
+                - name: FILE_NAME_COLUMN
+                  valueFrom:
+                    configMapKeyRef:
+                      name: s3-efs-cleanup-settings
+                      key: fileNameColumn
+                      optional: true
+                - name: EFS_PATH_COLUMN
+                  valueFrom:
+                    configMapKeyRef:
+                      name: s3-efs-cleanup-settings
+                      key: efsPathColumn
+                      optional: true
+                - name: EFS_BASE_PATH
+                  valueFrom:
+                    configMapKeyRef:
+                      name: s3-efs-cleanup-settings
+                      key: efsBasePath
+                      optional: true
+                - name: LOG_LEVEL
+                  valueFrom:
+                    configMapKeyRef:
+                      name: s3-efs-cleanup-settings
+                      key: logLevel
+                      optional: true
+              volumeMounts:
+                - name: cleanup-script
+                  mountPath: /scripts
+                  readOnly: true
+                - name: efs-storage
+                  mountPath: /efs
+          volumes:
+            - name: cleanup-script
+              configMap:
+                name: s3-efs-cleanup-script
+                defaultMode: 0550
+            - name: efs-storage
+              persistentVolumeClaim:
+                claimName: efs-shared-pvc
