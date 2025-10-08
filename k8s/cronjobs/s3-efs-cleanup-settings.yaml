@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: s3-efs-cleanup-settings
+  labels:
+    app.kubernetes.io/name: s3-efs-cleanup
+    app.kubernetes.io/component: configuration
+    app.kubernetes.io/part-of: data-hygiene
+data:
+  # Optional defaults that can be tailored to match your environment.
+  awsRegion: us-east-1
+  dbConnectTimeout: "10"
+  fileQuery: |
+    SELECT file_name, efs_path
+    FROM ingested_files
+    WHERE synced_to_s3 = true
+  fileNameColumn: file_name
+  efsPathColumn: efs_path
+  efsBasePath: /efs
+  logLevel: INFO
+  s3Prefix: processed
